@@ -25,6 +25,16 @@ Required environment variables (set in Render's dashboard, never in code):
                                   JSON key, as a single-line string, with
                                   edit access to the "Risk Dashboard" sheet
     SHEET_ID                 - the target Google Sheet's ID (from its URL)
+    DASHBOARD_ALLOWED_ORIGIN - the origin the React counsellor dashboard is
+                                served from (e.g. "http://localhost:5173" in
+                                dev, or your deployed dashboard's URL). Used
+                                for CORS — GET/PATCH /dashboard requests
+                                from any other origin are blocked by the
+                                browser. Defaults to "*" (any origin) if
+                                unset, which is fine for local development
+                                but should be locked down before any real
+                                deployment, since the dashboard shows
+                                (anonymised) student risk data.
 """
 
 import hashlib
@@ -34,6 +44,7 @@ from datetime import datetime, timezone
 
 import gspread
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from google.oauth2.service_account import Credentials
 from pydantic import BaseModel, Field
 
@@ -48,6 +59,17 @@ from classifier_genai_pipeline import (
 )
 
 app = FastAPI(title="Student Wellbeing Check-in Backend")
+
+# CORS: the React dashboard runs on a different origin than this API, so
+# the browser blocks its fetch()/PATCH calls unless explicitly allowed
+# here. See DASHBOARD_ALLOWED_ORIGIN in the module docstring above.
+_allowed_origin = os.environ.get("DASHBOARD_ALLOWED_ORIGIN", "*")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[_allowed_origin],
+    allow_methods=["GET", "PATCH"],
+    allow_headers=["*"],
+)
 
 # ---------------------------------------------------------------------------
 # Startup: train the classifier once at boot (synthetic data placeholder —
@@ -101,6 +123,13 @@ class CheckinResponse(BaseModel):
 # within-term follow-up matching if a counsellor needs it.
 ANON_SALT = os.environ.get("ANON_SALT", "change-me-per-term")
 
+# The exact tab name of your dashboard sheet within the spreadsheet
+# (confirmed as "Sheet1" — if you ever rename that tab, update this or set
+# the DASHBOARD_SHEET_NAME env var to match, or writes/reads will fail
+# loudly with a WorksheetNotFound error instead of silently going to the
+# wrong tab).
+DASHBOARD_SHEET_NAME = os.environ.get("DASHBOARD_SHEET_NAME", "Sheet1")
+
 
 def anonymise_email(email: str) -> str:
     digest = hashlib.sha256((ANON_SALT + email.strip().lower()).encode()).hexdigest()
@@ -122,7 +151,14 @@ def get_sheet():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     client = gspread.authorize(creds)
-    return client.open_by_key(sheet_id).sheet1
+    spreadsheet = client.open_by_key(sheet_id)
+    # NOTE: deliberately NOT using spreadsheet.sheet1 here. .sheet1 means
+    # "whichever tab is physically first/leftmost," not "the tab named
+    # Sheet1" — and it silently breaks the moment another tab gets
+    # inserted to its left (which is exactly what happened when Google
+    # Forms auto-created its own "Form Responses" tab). Referencing by
+    # name is position-independent and won't break again the same way.
+    return spreadsheet.worksheet(DASHBOARD_SHEET_NAME)
 
 
 def append_to_dashboard(anon_id: str, result: dict, guidance: dict):
@@ -137,8 +173,64 @@ def append_to_dashboard(anon_id: str, result: dict, guidance: dict):
             guidance["message"],
             ", ".join(guidance["suggested_resources"]),
             guidance["is_fallback"],
+            "FALSE",  # reviewed — new check-ins always start unreviewed (H6)
         ]
     )
+
+
+# Column layout (1-indexed, matches append_to_dashboard's write order):
+# A timestamp | B anon_id | C risk_level | D confidence |
+# E top_contributing_features | F guidance_message | G suggested_resources |
+# H is_fallback | I reviewed
+REVIEWED_COLUMN = 9
+
+
+def read_dashboard_rows() -> list[dict]:
+    """Reads all check-in rows for the counsellor dashboard. Returns each
+    row's actual Sheet row number (not just anon_id) as `row`, since
+    anon_id is NOT a unique key — the same student can have multiple
+    check-ins across the term (ANON_SALT only rotates per-term), and
+    "mark reviewed" needs to target one specific check-in, not every row
+    that student ever submitted.
+
+    Tolerant of older rows written before the `reviewed` column existed
+    (defaults them to not reviewed) rather than erroring."""
+    sheet = get_sheet()
+    all_values = sheet.get_all_values()
+    if len(all_values) <= 1:
+        return []  # header only, no check-ins yet
+
+    rows = []
+    for i, raw in enumerate(all_values[1:]):  # skip header row
+        sheet_row_number = i + 2  # +2: 1-indexed, plus the header row
+        # Pad defensively in case older rows have fewer columns than the
+        # current schema (e.g. rows written before `reviewed` existed).
+        padded = raw + [""] * (9 - len(raw))
+        try:
+            confidence = float(padded[3])
+        except ValueError:
+            confidence = 0.0
+        rows.append(
+            {
+                "row": sheet_row_number,
+                "id": padded[1],
+                "timestamp": padded[0],
+                "risk_level": padded[2],
+                "confidence": confidence,
+                "top_features": [f.strip() for f in padded[4].split(",") if f.strip()],
+                "guidance_message": padded[5],
+                "resources": [r.strip() for r in padded[6].split(",") if r.strip()],
+                "reviewed": padded[8].strip().upper() == "TRUE",
+            }
+        )
+    return rows
+
+
+def set_row_reviewed(row_number: int):
+    sheet = get_sheet()
+    if row_number < 2:
+        raise HTTPException(status_code=422, detail="Invalid row number")
+    sheet.update_cell(row_number, REVIEWED_COLUMN, "TRUE")
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +241,33 @@ def append_to_dashboard(anon_id: str, result: dict, guidance: dict):
 @app.get("/")
 def health_check():
     return {"status": "ok", "service": "student-wellbeing-backend"}
+
+
+@app.get("/dashboard")
+def get_dashboard():
+    """Returns all check-in rows for the counsellor dashboard, most recent
+    first. Never exposes raw identifiers — anon_id (as `id`) is already
+    the anonymised pseudonym written by /checkin, and this only reads
+    columns that were already anonymised at write time."""
+    try:
+        rows = read_dashboard_rows()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    rows.sort(key=lambda r: r["timestamp"], reverse=True)
+    return rows
+
+
+@app.patch("/dashboard/{row_number}")
+def mark_dashboard_row_reviewed(row_number: int):
+    """Marks a single check-in as reviewed by a counsellor (H6:
+    human-in-the-loop before any follow-up contact). Targets the exact
+    Sheet row — NOT the student's anon_id — since one student can have
+    multiple check-in rows and only one should be marked here."""
+    try:
+        set_row_reviewed(row_number)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    return {"row": row_number, "reviewed": True}
 
 
 @app.post("/checkin", response_model=CheckinResponse)

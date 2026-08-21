@@ -87,8 +87,10 @@ _, MODEL_ARTIFACTS = train_and_compare_models(_dataset)
 
 
 class CheckinSubmission(BaseModel):
-    # Identifying field — used ONLY to derive an anonymised hash, then discarded.
-    respondent_email: str = Field(..., description="Used only to derive a rotating pseudonymous ID; never stored raw.")
+    # Identifying-ish field — actually just Apps Script's unique per-response
+    # ID (getId()), not a real identifier. The Form has email collection
+    # turned off by design, so this is what gets hashed into anon_id instead.
+    response_id: str = Field(..., description="Unique Apps-Script-assigned response ID, hashed into anon_id. Never a real student identifier.")
 
     # MBI-SS subscale responses (already averaged/summed client-side or raw items)
     exhaustion: float
@@ -131,8 +133,15 @@ ANON_SALT = os.environ.get("ANON_SALT", "change-me-per-term")
 DASHBOARD_SHEET_NAME = os.environ.get("DASHBOARD_SHEET_NAME", "Sheet1")
 
 
-def anonymise_email(email: str) -> str:
-    digest = hashlib.sha256((ANON_SALT + email.strip().lower()).encode()).hexdigest()
+def anonymise_response_id(response_id: str) -> str:
+    """Hashes the Form's unique per-response ID (not an email — email
+    collection is off by design) into a pseudonymous anon_id. Because
+    Apps Script's getId() is unique per submission (not per student), this
+    intentionally means the SAME student submitting twice in one term
+    gets two DIFFERENT anon_ids — there is no cross-submission linking of
+    one student's history, by design, since no student identifier is ever
+    collected in the first place."""
+    digest = hashlib.sha256((ANON_SALT + response_id.strip()).encode()).hexdigest()
     return f"student_{digest[:12]}"
 
 
@@ -272,7 +281,7 @@ def mark_dashboard_row_reviewed(row_number: int):
 
 @app.post("/checkin", response_model=CheckinResponse)
 def handle_checkin(submission: CheckinSubmission):
-    anon_id = anonymise_email(submission.respondent_email)
+    anon_id = anonymise_response_id(submission.response_id)
 
     record = {}
     for col in FEATURE_COLS:

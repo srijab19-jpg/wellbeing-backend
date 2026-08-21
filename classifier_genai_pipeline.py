@@ -74,8 +74,15 @@ BIN_ORDERS = {
     # don't. These strings must match EXACTLY, including that
     # inconsistency, or encode_bin() will correctly reject the answer.
     "attendance_pct": ["0-20%", "21% - 40%", "41% - 60%", "61%-80%", "81% - 100%"],
-    "missed_deadlines": ["0-5", "6-10", "11-15", "16-20"],
-    "weekly_study_hours": ["0-20", "21-40", "41-60", "61-80"],
+    # Updated Aug 21, 2026: BH2 max reduced to 12 (was 20), does not start
+    # at 0 (a "0 missed deadlines" case is out of scope for this field's
+    # purpose — this bin only fires once a student has missed at least 1).
+    "missed_deadlines": ["1-3", "4-6", "7-9", "10-12"],
+    # Updated Aug 21, 2026: BH3 does not start at 0, and the top bin is
+    # OPEN-ENDED ("13+") rather than a hard ceiling, so a student studying
+    # more than 12 hours/week still has a valid option to select instead
+    # of being forced into a wrong bin or blocked by Form validation.
+    "weekly_study_hours": ["1-3", "4-6", "7-9", "10-12", "13+"],
 }
 
 
@@ -142,7 +149,7 @@ def generate_synthetic_dataset(n=600, seed=RANDOM_STATE):
     # lowest/first bin in BIN_ORDERS for that field.
     n_attendance_bins = len(BIN_ORDERS["attendance_pct"])  # 5
     n_deadline_bins = len(BIN_ORDERS["missed_deadlines"])  # 4
-    n_study_bins = len(BIN_ORDERS["weekly_study_hours"])  # 4
+    n_study_bins = len(BIN_ORDERS["weekly_study_hours"])  # 5 (incl. open-ended "13+" top bin)
 
     attendance_pct = rng.integers(0, n_attendance_bins, n)  # bin index; higher = better attendance
     missed_deadlines = rng.integers(0, n_deadline_bins, n)  # bin index; higher = more missed
@@ -434,8 +441,8 @@ if __name__ == "__main__":
         "cynicism": 4,
         "efficacy_reversed": 4,  # i.e. low reported efficacy
         "attendance_pct": encode_bin("attendance_pct", "41% - 60%"),
-        "missed_deadlines": encode_bin("missed_deadlines", "11-15"),
-        "weekly_study_hours": encode_bin("weekly_study_hours", "0-20"),
+        "missed_deadlines": encode_bin("missed_deadlines", "7-9"),
+        "weekly_study_hours": encode_bin("weekly_study_hours", "4-6"),
     }
 
     classification = classify_student(example_student, artifacts)
